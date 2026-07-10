@@ -1,89 +1,53 @@
 use crate::channels::SyncSenderExt;
 use crate::register_client;
-use gtk::ApplicationInhibitFlags;
 use gtk::glib;
-use gtk::prelude::*;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, trace};
 
-fn get_app() -> gtk::Application {
-    gtk::gio::Application::default()
-        .and_downcast()
-        .expect("GTK application not initialized")
-}
-
-/// Uninhibits on drop.
-struct InhibitCookie(u32);
-
-impl Drop for InhibitCookie {
-    fn drop(&mut self) {
-        trace!("dropped inhibit cookie: {}", self.0);
-        get_app().uninhibit(self.0);
-    }
-}
-
-fn gtk_inhibit() -> Option<InhibitCookie> {
-    let app = get_app();
-    let window = app.windows().into_iter().next();
-    let id = app.inhibit(
-        window.as_ref(),
-        ApplicationInhibitFlags::IDLE,
-        Some("Ironbar inhibit"),
-    );
-    if id == 0 {
-        error!("GTK inhibit failed - platform may not support it");
-        None
-    } else {
-        trace!("created inhibit cookie: {id}");
-        Some(InhibitCookie(id))
-    }
-}
-
-/// The held GTK cookie and its remaining duration: both exist, or neither.
-#[derive(Default)]
+/// Tracks the single, global inhibit state: the authoritative remaining
+/// duration, plus the live countdown. The actual OS-level idle inhibitor is
+/// created per-bar by the inhibit module (which owns a `gtk::Window` and lets
+/// GTK translate it into a Wayland `zwp_idle_inhibitor`); this client only holds
+/// the shared state so every bar's widget shows the same thing.
 struct Inhibitor {
-    current: Option<(InhibitCookie, Duration)>,
+    duration: Option<Duration>,
 }
 
 impl Inhibitor {
+    fn new() -> Self {
+        Self { duration: None }
+    }
+
     fn remaining(&self) -> Option<Duration> {
-        self.current.as_ref().map(|(_, duration)| *duration)
+        self.duration
     }
 
     fn is_counting_down(&self) -> bool {
-        self.remaining()
+        self.duration
             .is_some_and(|duration| duration != Duration::MAX)
     }
 
     /// `Some` starts the inhibit or updates its duration; `None` stops it.
     fn set_remaining(&mut self, target: Option<Duration>) {
-        match target {
-            None => self.current = None,
-            Some(duration) => {
-                if let Some((_, existing)) = &mut self.current {
-                    *existing = duration;
-                } else {
-                    self.current = gtk_inhibit().map(|cookie| (cookie, duration));
-                }
-            }
-        }
+        self.duration = target;
     }
 
-    /// Decrements the countdown, dropping the cookie at zero.
+    /// Decrements the countdown, clearing the state at zero.
     fn tick(&mut self) {
-        if let Some((_, duration)) = &mut self.current {
+        if let Some(duration) = &mut self.duration {
             *duration = duration.saturating_sub(Duration::from_secs(1));
         }
-        if self.remaining() == Some(Duration::ZERO) {
-            self.current = None;
+        if self.duration == Some(Duration::ZERO) {
+            self.duration = None;
         }
     }
 }
 
-/// Process-global inhibit: owns the GTK cookie and the live countdown in a single
-/// `glib` task. Each widget updates its label to the same remaining duration.
-/// When the timer stops, each widget reverts to its currently-selected preset (`durations[idx]`).
+/// Process-global inhibit state: owns the live countdown in a single `glib`
+/// task and broadcasts the remaining duration. Every widget subscribes to the
+/// same remaining duration (so they stay in sync); each bar creates its own
+/// inhibitor from the shared active state. When the timer stops, each widget
+/// reverts to its currently-selected preset.
 #[derive(Debug)]
 pub struct Client {
     req_tx: mpsc::UnboundedSender<Option<Duration>>,
@@ -91,7 +55,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// Must be called on the GTK main thread - spawns the cookie/countdown task.
+    /// Must be called on the GTK main thread - spawns the countdown task.
     pub(crate) fn new() -> Self {
         let (req_tx, mut rx) = mpsc::unbounded_channel::<Option<Duration>>();
         let (remaining_tx, _) = watch::channel(None::<Duration>);
@@ -99,11 +63,11 @@ impl Client {
         glib::spawn_future_local({
             let remaining_tx = remaining_tx.clone();
             async move {
-                let mut inhibitor = Inhibitor::default();
+                let mut inhibitor = Inhibitor::new();
 
                 loop {
                     tokio::select! {
-                        Some(request) = rx.recv() => inhibitor.set_remaining(request),
+                        Some(duration) = rx.recv() => inhibitor.set_remaining(duration),
                         // Timer armed only while a finite countdown runs.
                         () = glib::timeout_future_seconds(1),
                             if inhibitor.is_counting_down() => inhibitor.tick(),

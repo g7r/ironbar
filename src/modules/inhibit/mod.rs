@@ -1,6 +1,9 @@
 use color_eyre::Result;
+use gtk::glib;
 use gtk::prelude::*;
-use gtk::{Button, Label};
+use gtk::{Application, ApplicationInhibitFlags, Button, Label};
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 
@@ -34,6 +37,41 @@ fn format_duration(d: Duration) -> String {
 pub struct State {
     active: bool,
     duration: Duration,
+}
+
+/// Owns this bar's OS idle inhibitor (a GTK application inhibit cookie bound to
+/// the bar's window).
+struct WindowInhibitor {
+    app: Application,
+    cookie: Cell<Option<u32>>,
+}
+
+impl WindowInhibitor {
+    /// Drive the inhibitor to `want`: acquire it when wanted, release it when not.
+    fn set(&self, want: bool, button: &Button) {
+        match (want, self.cookie.get()) {
+            (true, None) => {
+                if let Some(window) = button.native().and_downcast::<gtk::Window>() {
+                    let id = self.app.inhibit(
+                        Some(&window),
+                        ApplicationInhibitFlags::IDLE,
+                        Some("Ironbar inhibit"),
+                    );
+                    // On Wayland, current GTK never returns 0 here: it hands back
+                    // a monotonic cookie regardless of whether the idle-inhibit
+                    // actually took effect.
+                    if id != 0 {
+                        self.cookie.set(Some(id));
+                    }
+                }
+            }
+            (false, Some(id)) => {
+                self.app.uninhibit(id);
+                self.cookie.set(None);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Module<Button> for InhibitModule {
@@ -90,7 +128,7 @@ impl Module<Button> for InhibitModule {
     fn into_widget(
         self,
         ctx: WidgetContext<Self::SendMessage, Self::ReceiveMessage>,
-        _info: &ModuleInfo,
+        info: &ModuleInfo,
     ) -> Result<ModuleParts<Button>> {
         let button = Button::new();
         button.add_css_class("inhibit");
@@ -99,6 +137,43 @@ impl Module<Button> for InhibitModule {
             .justify(self.layout.justify.into())
             .build();
         button.set_child(Some(&label));
+
+        // This bar owns the idle inhibitor for its OWN window, driven by the
+        // shared active state. Because every inhibit bar holds its own, idle
+        // stays inhibited as long as any one of them is alive, so unplugging a
+        // single monitor's bar does not drop the inhibit while another remains.
+        let inhibitor = Rc::new(WindowInhibitor {
+            app: info.app.clone(),
+            cookie: Cell::new(None),
+        });
+
+        let active = Rc::new(Cell::new(false));
+
+        button.connect_realize({
+            let inhibitor = inhibitor.clone();
+            let active = active.clone();
+            move |button| inhibitor.set(active.get(), button)
+        });
+        button.connect_unrealize({
+            let inhibitor = inhibitor.clone();
+            move |button| inhibitor.set(false, button)
+        });
+
+        glib::spawn_future_local({
+            let mut remaining_rx = ctx.client::<inhibit::Client>().subscribe();
+            let button = button.clone();
+            let active = active.clone();
+            let inhibitor = inhibitor.clone();
+            async move {
+                loop {
+                    active.set(remaining_rx.borrow().is_some());
+                    inhibitor.set(active.get(), &button);
+                    if remaining_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
 
         let tx = ctx.controller_tx.clone();
         [
